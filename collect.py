@@ -1,8 +1,8 @@
 """Recoleccion de datos de Steam (VERSION SENCILLA: SteamSpy + Steam Store API).
 
 Que hace, en orden:
-  1. Descarga la lista de juegos de SteamSpy (request=all, 1000 juegos por pagina,
-     ordenados por propietarios de mayor a menor). Es el universo de esta version.
+  1. Descarga la lista de juegos de SteamSpy (request=all, 1000 juegos por pagina).
+     Es el universo de esta version; se ordena por propietarios al cargarla.
   2. Arma dos grupos de juegos, consultando la Store API para validar cada candidato:
        - "top":       los N_TOP con mas propietarios
        - "aleatoria": N_ALEATORIA elegidos al azar (semilla fija, reproducible)
@@ -33,7 +33,7 @@ from pathlib import Path
 
 import requests
 
-from steam_parsers import parse_release_date
+from steam_parsers import parse_owners, parse_release_date
 
 SPY_URL = "https://steamspy.com/api.php"
 STORE_URL = "https://store.steampowered.com/api/appdetails"
@@ -77,6 +77,14 @@ def guardar_json(ruta, respuesta):
 
 def leer_json(ruta):
     return json.loads(ruta.read_text(encoding="utf-8"))["respuesta"]
+
+
+def entero(valor):
+    """Convierte a entero un valor que puede venir como numero, texto o vacio."""
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        return 0
 
 
 def cumple_criterios(store):
@@ -167,7 +175,12 @@ class Recolector:
         return False
 
     def cargar_universo(self):
-        """Juegos de la lista, en orden de propietarios (de mayor a menor), sin repetidos."""
+        """Juegos de la lista, sin repetidos, ordenados por propietarios estimados (mayor a menor).
+
+        El orden se calcula aqui y no depende de como entregue SteamSpy las paginas.
+        Como los propietarios vienen en rangos hay muchos empates; se desempata por
+        numero de resenas (positivas + negativas).
+        """
         universo, vistos = [], set()
         for archivo in sorted((self.carpeta / "steamspy_all").glob("pagina_*.json")):
             for clave, juego in leer_json(archivo).items():
@@ -175,7 +188,11 @@ class Recolector:
                 if appid in vistos:
                     continue
                 vistos.add(appid)
-                universo.append({"appid": appid, "nombre": juego.get("name") or ""})
+                _, _, medio = parse_owners(juego.get("owners"))
+                resenas = entero(juego.get("positive")) + entero(juego.get("negative"))
+                universo.append({"appid": appid, "nombre": juego.get("name") or "",
+                                 "propietarios": medio or 0, "resenas": resenas})
+        universo.sort(key=lambda j: (-j["propietarios"], -j["resenas"]))
         return universo
 
     # ---------- 2. validacion y fichas ----------
