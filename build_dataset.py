@@ -8,6 +8,7 @@ Entrada (carpeta --raw, por defecto data/raw):
 Salida (carpeta --out, por defecto data/processed):
     steam_juegos.csv       una fila por juego, con variables ya limpias
     steam_etiquetas.csv    formato largo: appid, etiqueta, votos, proporcion
+    steam_generos.csv      formato largo: appid, genero (generos de la Store, multi-etiqueta)
 
 Notas de interpretacion (basadas en fichas reales):
   - SteamSpy 'price' = 0 NO significa gratuito: tambien aparece en juegos de pago sin precio
@@ -16,6 +17,11 @@ Notas de interpretacion (basadas en fichas reales):
     (en Team Fortress 2: 48,246 frente a 1,161,472). Para resenas se usa SteamSpy y la
     cifra de la Store se guarda aparte como 'recomendaciones_store'.
   - Tiempos de juego de SteamSpy: minutos (segun recuerdo), se convierten a horas.
+  - La Store lista los generos en ORDEN ALFABETICO, asi que el "primer genero" no es el principal
+    (en la muestra, 22 de 29 juegos daban 'Action'). Por eso no hay genero_principal: los generos
+    van en formato largo (steam_generos.csv) y se analiza por pertenencia (multi-etiqueta).
+  - precio_ref_usd: precio de la Store si existe; si no, el de SteamSpy cuando es > 0 (juegos de pago
+    que la Store ya no vende, p. ej. Call of Duty MWII); si no, vacio. fuente_precio dice cual se uso.
 """
 
 import argparse
@@ -32,6 +38,11 @@ from steam_parsers import (parse_languages, parse_owners, parse_price_spy,
                            tiene_espanol_latam)
 
 GENEROS_NO_PRINCIPALES = {"Free To Play", "Early Access"}
+# Generos de la Store que marcan programas (no juegos). Se conservan en la tabla con es_software=True
+# para poder excluirlos en el analisis.
+GENEROS_SOFTWARE = {"Utilities", "Animation & Modeling", "Design & Illustration", "Photo Editing",
+                    "Video Production", "Audio Production", "Software Training", "Web Publishing",
+                    "Game Development", "Education", "Accounting"}
 
 
 def leer_envoltorio(ruta):
@@ -109,9 +120,9 @@ def extraer_store(capturado, store):
         "espanol": tiene_espanol(idiomas),
         "espanol_latam": tiene_espanol_latam(idiomas),
         "espanol_audio": tiene_espanol(list(audio)),
-        "generos_store": "; ".join(generos),
-        "genero_principal": principales[0] if principales else "Sin género",
+        "generos_store": "; ".join(principales),
         "n_generos": len(principales),
+        "es_software": any(g in GENEROS_SOFTWARE for g in generos),
         "early_access": "Early Access" in generos,
         "un_jugador": "Single-player" in categorias,
         "multijugador": "Multi-player" in categorias,
@@ -163,12 +174,22 @@ def extraer_spy(ficha):
     }, filas_etiquetas
 
 
+def precio_referencia(v_store, v_spy):
+    """Precio unico para analizar: Store; si falta, SteamSpy si es > 0; si no, vacio."""
+    if v_store["estado_precio"] in ("gratuito", "de_pago"):
+        return {"precio_ref_usd": v_store["precio_usd"], "fuente_precio": "store"}
+    spy = v_spy["precio_spy_usd"]
+    if spy:
+        return {"precio_ref_usd": spy, "fuente_precio": "steamspy"}
+    return {"precio_ref_usd": None, "fuente_precio": "sin_dato"}
+
+
 def construir(raw, out):
     raw, out = Path(raw), Path(out)
     with (raw / "muestra.csv").open(encoding="utf-8", newline="") as f:
         muestra = list(csv.DictReader(f))
 
-    juegos, etiquetas = [], []
+    juegos, etiquetas, generos = [], [], []
     omitidos = {"sin_store": 0, "store_no_valido": 0, "sin_spy": 0}
     for fila in muestra:
         appid = fila["appid"]
@@ -184,14 +205,17 @@ def construir(raw, out):
             omitidos["sin_spy"] += 1
             continue
         variables_spy, filas_etiquetas = extraer_spy(ficha)
+        variables_store = extraer_store(capturado, store)
+        variables_store.update(precio_referencia(variables_store, variables_spy))
         juegos.append({
             "appid": int(appid),
             "nombre": fila["nombre"],
             "grupo": fila["grupo"],
             "posicion_propietarios": int(fila["posicion_propietarios"]),
-            **extraer_store(capturado, store),
+            **variables_store,
             **variables_spy,
         })
+        generos.extend((int(appid), g) for g in (variables_store["generos_store"] or "").split("; ") if g)
         etiquetas.extend((int(appid), t, v, round(p, 5)) for t, v, p in filas_etiquetas)
 
     out.mkdir(parents=True, exist_ok=True)
@@ -199,6 +223,8 @@ def construir(raw, out):
     tabla.to_csv(out / "steam_juegos.csv", index=False, encoding="utf-8")
     pd.DataFrame(etiquetas, columns=["appid", "etiqueta", "votos", "proporcion"]).to_csv(
         out / "steam_etiquetas.csv", index=False, encoding="utf-8")
+    pd.DataFrame(generos, columns=["appid", "genero"]).to_csv(
+        out / "steam_generos.csv", index=False, encoding="utf-8")
     return tabla, omitidos, len(muestra)
 
 
@@ -222,4 +248,13 @@ if __name__ == "__main__":
         nulos = nulos[nulos > 0].sort_values(ascending=False)
         print("\n% de valores vacios por columna (solo las que tienen):")
         print(nulos.to_string() if len(nulos) else "ninguna")
+        print("\nEstado de precio por grupo:")
+        print(pd.crosstab(tabla["grupo"], tabla["estado_precio"]).to_string())
+        print("\nFuente del precio de referencia:", tabla["fuente_precio"].value_counts().to_dict())
+        print(f"Software (no juegos)  : {int(tabla['es_software'].sum()):,}")
+        print(f"Early Access          : {tabla['early_access'].mean():.1%}")
+        print(f"Sin resenas           : {int((tabla['resenas_total'] == 0).sum()):,}")
+        print(f"Capturas de la Store  : {tabla['fecha_captura_store'].min()} a {tabla['fecha_captura_store'].max()}")
+        print("\nJuegos por año de lanzamiento y grupo:")
+        print(pd.crosstab(tabla["anio_lanzamiento"], tabla["grupo"]).to_string())
         print(f"\nGuardado en {Path(args.out) / 'steam_juegos.csv'}")
